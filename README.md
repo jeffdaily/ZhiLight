@@ -43,6 +43,15 @@ cd ./ZhiLight && pip install -e .
 # Start OpenAI compatible server
 python -m zhilight.server.openai.entrypoints.api_server [options]
 ```
+
+### Build for AMD GPUs (ROCm)
+ZhiLight also builds for AMD GPUs through ROCm/HIP. It requires a ROCm install and a ROCm build of PyTorch; the CUDA libraries map to their ROCm equivalents (cuBLAS/cuBLASLt -> hipBLAS/hipBLASLt, NCCL -> RCCL). Set `USE_HIP=ON` and pass the gfx target for your GPU (for example `gfx90a` for MI200, `gfx1100` for RDNA3).
+```bash
+ROCM_PATH=${ROCM_PATH:-/opt/rocm}
+HIPCXX=$ROCM_PATH/lib/llvm/bin/clang++ ZHILIGHT_USE_HIP=1 \
+  CMAKE_ARGS="-DUSE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_HIP_COMPILER=$ROCM_PATH/lib/llvm/bin/clang++ -DCMAKE_HIP_PLATFORM=amd" \
+  CMAKE_BUILD_PARALLEL_LEVEL=32 TESTING=0 python setup.py bdist_wheel
+```
 ## ✈️ Docker Image
 ZhiLight only depends on the CUDA runtime, cuBLAS, NCCL, and a few Python packages in requirements.txt. You can use the image below for running or building it. You can also directly refer to docker/Dockerfile.
 ```bash

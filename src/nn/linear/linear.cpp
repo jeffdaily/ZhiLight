@@ -635,6 +635,11 @@ public:
     }
 };
 
+// GPTQ / Marlin / AWQ / fp8 quantized Linear implementations are deferred on the
+// first AMD pass: they call NVIDIA tensor-core/PTX kernels (marlin mma.sync,
+// awq ldmatrix, gptq prmt/__vsub4, fp8 cvt.e4m3x2) excluded from the HIP build.
+// The Linear factory above throws for these quant types under USE_HIP.
+#if !defined(USE_HIP)
 class Linear::impl::Int4GPTQ : public Linear::impl {
     const int group_size;
 public:
@@ -1948,6 +1953,7 @@ public:
 #endif
     }
 };
+#endif // !USE_HIP  (GPTQ/Marlin/AWQ/fp8 quantized Linear impls)
 
 Linear::Linear(
     const core::Context& ctx,
@@ -1962,6 +1968,19 @@ Linear::Linear(
     core::DataType dtype)
     : Layer() {
     int quant = static_cast<int>(quant_config.quant_type);
+#if defined(USE_HIP)
+    // GPTQ/AWQ/Marlin/fp8 quant linears use NVIDIA tensor-core / PTX kernels
+    // that are deferred on the first AMD pass. fp16/bf16 (NormalLinear) and the
+    // cublasLt-int8 path (Int8Linear) are supported; quantized weights are not.
+    if (quant_config.quant_type == model::QuantType::FP8
+        || quant_config.quant_type == model::QuantType::FP8_Block
+        || quant_config.quant_type == model::QuantType::AWQ
+        || quant_config.quant_type == model::QuantType::GPTQ
+        || quant_config.quant_type == model::QuantType::GPTQ_Marlin) {
+        BM_EXCEPTION("GPTQ/AWQ/Marlin/fp8 quantized Linear is not supported on ROCm/HIP "
+                     "on the first AMD pass (tensor-core/PTX kernels deferred).");
+    } else if (quant) {
+#else
     if (quant_config.quant_type == model::QuantType::FP8) {
         pimpl.reset(new impl::Fp8Linear(
             ctx, dim_in, dim_out, act_fn_type, quant, dtype, parallel, dist_layout));
@@ -1989,6 +2008,7 @@ Linear::Linear(
             ctx, dim_in, dim_out, act_fn_type, quant, dtype, parallel, dist_layout, act_order, group_size, sym);
         pimpl = std::unique_ptr<impl>((impl *) tmp);
     } else if (quant) {
+#endif
         auto tmp = new impl::Int8Linear(
             ctx, dim_in, dim_out, act_fn_type, quant, scale_weights, weight_transposed, dtype, parallel, dist_layout);
         add_parameter("weight_quant", tmp->weight);
@@ -2094,6 +2114,7 @@ void Linear::load_state_dict(
     this->prefix = prefix;
     pimpl->load_state_dict(ctx, state_dict, prefix, allow_missing);
 
+#if !defined(USE_HIP)
     bool dequant_desc_act = utils::get_int_env("DEQUANT_DESC_ACT", 0) > 0;
     impl::Int4GPTQ* q = dynamic_cast<impl::Int4GPTQ*>(pimpl.get());
     if (dequant_desc_act && q && q->parallel && q->act_order && !q->dim_out_parallel) {
@@ -2104,6 +2125,7 @@ void Linear::load_state_dict(
         *new_p->weight = w;
         pimpl.reset(new_p);
     }
+#endif
 }
 
 Linear* Linear::fuse(const core::Context& ctx, Linear& q, Linear& k) {
@@ -2165,6 +2187,9 @@ std::vector<Linear*> Linear::split(const core::Context& ctx, size_t n_split, boo
 }
 
 bool Linear::support_fuse_gptq_gate_in(const Tensor& input) {
+#if defined(USE_HIP)
+    return false;  // GPTQ quant Linear is deferred on AMD.
+#else
     static int fuse_w_in = utils::get_int_env("CPM_FUSE_FF_IN", 0);
     auto ptr = dynamic_cast<impl::Int4GPTQ*>(pimpl.get());
     return ptr
@@ -2174,14 +2199,19 @@ bool Linear::support_fuse_gptq_gate_in(const Tensor& input) {
             && !ptr->act_order
             && !ptr->trt_kernel
             && ptr->qweight.numel() > 0;
+#endif
 }
 
 std::tuple<core::Tensor, core::Tensor, core::Tensor, bool> Linear::get_gptq_weights() {
+#if defined(USE_HIP)
+    return std::make_tuple(Tensor(), Tensor(), Tensor(), false);  // GPTQ deferred on AMD.
+#else
     auto ptr = dynamic_cast<impl::Int4GPTQ*>(pimpl.get());
     if (!ptr) {
         return {Tensor(), Tensor(), Tensor(), false};
     }
     return {ptr->qweight, ptr->qzeros, ptr->scales, ptr->sym};
+#endif
 }
 
 void Linear::set_has_bias(bool b) {
@@ -2189,11 +2219,13 @@ void Linear::set_has_bias(bool b) {
 }
 
 void Linear::dequant_cache_weight(core::Context& ctx, const core::Tensor& fake_input) {
+#if !defined(USE_HIP)
     auto gptq_ptr = dynamic_cast<impl::Int4GPTQ*>(pimpl.get());
     model::ModelContext* m_ctx = model::ModelContext::cast(ctx);
     if (gptq_ptr && m_ctx) {
         gptq_ptr->dequant_cache_weight(*m_ctx, fake_input);
     }
+#endif
 }
 
 core::Tensor Linear::grouped_gemm_fp8_block(
@@ -2201,9 +2233,13 @@ core::Tensor Linear::grouped_gemm_fp8_block(
     const core::Tensor& input,
     const core::Tensor& m_indices,
     int num_groups) {
+#if defined(USE_HIP)
+    BM_EXCEPTION("fp8-block grouped GEMM is not supported on ROCm/HIP (deferred).");
+#else
     auto ptr = dynamic_cast<impl::Fp8Block*>(pimpl.get());
     BM_ASSERT(ptr, "Not Fp8Block impl");
     return ptr->grouped_gemm(ctx, input, m_indices, num_groups);
+#endif
 }
 
 // When num_kv_heads < TP; we load parameter of specified partition.

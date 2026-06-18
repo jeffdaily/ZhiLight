@@ -9,8 +9,15 @@ namespace functions {
 
 template<typename T> __host__ __device__ inline T Inf();
 template<> __host__ __device__ inline constexpr float Inf() { return __builtin_huge_valf(); }
+#if defined(USE_HIP)
+// clang rejects a reinterpret_cast in a constexpr; the bit-pattern build is a
+// runtime inline here (same value, identical codegen).
+template<> __host__ __device__ inline half Inf() { const short v = 0x7c00; return *(reinterpret_cast<const half *>(&(v))); }
+template<> __host__ __device__ inline nv_bfloat16 Inf() { const short v = 0x7f80; return *(reinterpret_cast<const nv_bfloat16 *>(&(v))); }
+#else
 template<> __host__ __device__ inline constexpr half Inf() { const short v = 0x7c00; return *(reinterpret_cast<const half *>(&(v))); }
 template<> __host__ __device__ inline constexpr nv_bfloat16 Inf() { const short v = 0x7f80; return *(reinterpret_cast<const nv_bfloat16 *>(&(v))); }
+#endif
 template<> __host__ __device__ inline constexpr double Inf() { return __builtin_huge_val(); }
 template<> __host__ __device__ inline constexpr int32_t Inf() { return __INT_MAX__; }
 template<> __host__ __device__ inline constexpr int64_t Inf() { return __LONG_MAX__; }

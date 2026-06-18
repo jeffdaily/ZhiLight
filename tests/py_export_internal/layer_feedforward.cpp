@@ -200,20 +200,36 @@ public:
     void load_state_dict(const std::map<std::string, py::array>& state_dict)
         __attribute__((visibility("hidden"))) {
 
+        // bind::load_state_dict touches py::array (numpy buffer protocol = Python
+        // C-API), which requires the GIL. The main thread holds the GIL and then
+        // join()s the worker, so a worker that needs the GIL deadlocks. For the
+        // single-GPU case (the validation path) run inline on the GIL-holding
+        // main thread; only fan out to worker threads when there are multiple
+        // GPUs, and have each worker acquire the GIL before the numpy access.
+        int n = engine->num_gpus();
+        if (n <= 1) {
+            auto ctx = engine->create_context({ 0 });
+            bmengine::core::WithDevice device(ctx, 0);
+            auto named_params = mds[0]->named_parameters("ff", true);
+            bind::load_state_dict(ctx, state_dict, named_params);
+            return;
+        }
+
         std::vector<std::thread> threads;
-
-        for (int i = 0; i < engine->num_gpus(); ++i) {
-
+        for (int i = 0; i < n; ++i) {
             threads.emplace_back([this, i, &state_dict] {
+                py::gil_scoped_acquire gil;
                 auto ctx = engine->create_context({ i });
                 bmengine::core::WithDevice device(ctx, 0);
                 auto named_params = mds[i]->named_parameters("ff", true);
                 bind::load_state_dict(ctx, state_dict, named_params);
             });
         }
-
-        for (auto it = threads.begin(); it != threads.end(); ++it) {
-            it->join();
+        {
+            py::gil_scoped_release release;  // let the workers acquire the GIL
+            for (auto it = threads.begin(); it != threads.end(); ++it) {
+                it->join();
+            }
         }
     }
 

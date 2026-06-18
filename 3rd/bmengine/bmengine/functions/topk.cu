@@ -5,6 +5,19 @@ namespace bmengine {
 
 namespace functions {
 
+// XOR-permute within the warp/wavefront. On HIP the no-mask form spans the full
+// (32- or 64-lane) wavefront; CUDA keeps the full-warp 32-bit mask. The bitonic
+// groups are width-N (N <= wave size), so lane^j stays inside the wavefront and
+// the permute is correct on wave32 and wave64.
+template<typename T>
+static __device__ inline T warpXorShfl(T v, int laneMask) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    return __shfl_xor(v, laneMask);
+#else
+    return __shfl_xor_sync(0xFFFFFFFF, v, laneMask);
+#endif
+}
+
 template<typename T, int N>
 static __device__ inline void warpBitonicSort(T& v1, int& pos, bool asc) {
     int lane_id = threadIdx.x & (N - 1);
@@ -13,8 +26,8 @@ static __device__ inline void warpBitonicSort(T& v1, int& pos, bool asc) {
         bool desc = ((lane_id & k) == 0) ^ asc;
 #pragma unroll
         for (int j = k / 2; j > 0; j /= 2) {
-            T v2 = __shfl_xor_sync(0xFFFFFFFF, v1, j);
-            int pos2 = __shfl_xor_sync(0xFFFFFFFF, pos, j);
+            T v2 = warpXorShfl(v1, j);
+            int pos2 = warpXorShfl(pos, j);
             bool upper = (lane_id & j) != 0;
 
             if (desc ^ (v1 > v2 || (v1 == v2 && pos < pos2)) ^ upper) {
@@ -35,8 +48,8 @@ static __device__ inline void warpBitonicMerge(T& v1, int& pos1, T& v2, int& pos
 // resort
 #pragma unroll
     for (int j = N / 2; j > 0; j /= 2) {
-        v2 = __shfl_xor_sync(0xFFFFFFFF, v1, j);
-        int pos2 = __shfl_xor_sync(0xFFFFFFFF, pos1, j);
+        v2 = warpXorShfl(v1, j);
+        int pos2 = warpXorShfl(pos1, j);
         bool upper = (lane_id & j) != 0;
         if ((v1 < v2 || (v1 == v2 && pos1 > pos2)) ^ upper) {
             v1 = v2;

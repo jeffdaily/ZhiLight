@@ -31,9 +31,11 @@ struct LtGemmAlgoAttr {
     int wave_count;
 };
 
+#if !defined(USE_HIP)
 LtGemmAlgoAttr get_algo_attr(const cublasLtMatmulAlgo_t* algo);
 std::string tile_to_str(int id);
 std::string stage_to_str(int id);
+#endif
 
 // clang-format off
 class Gemm::impl {
@@ -71,8 +73,16 @@ public:
             compute_type = CUBLAS_COMPUTE_32F;
             scale_type = in_type = out_type = CUDA_R_32F;
         } else if (data_type == core::DataType::kHalf) {
+#if defined(USE_HIP)
+            // hipBLASLt on gfx90a rejects 16F compute/scale (INVALID_VALUE);
+            // use 32F compute + 32F scale with fp16 I/O (matches the bf16 path).
+            compute_type = CUBLAS_COMPUTE_32F;
+            scale_type = CUDA_R_32F;
+            in_type = out_type = CUDA_R_16F;
+#else
             compute_type = CUBLAS_COMPUTE_16F;
             scale_type = in_type = out_type = CUDA_R_16F;
+#endif
         } else if (data_type == core::DataType::kBFloat16) {
             // Only support 32F
             compute_type = CUBLAS_COMPUTE_32F;
@@ -173,6 +183,50 @@ public:
         }
     }
 
+#if defined(USE_HIP)
+    // hipBLASLt has no cublasLtMatmulAlgoInit / AlgoConfigGetAttribute / tile+
+    // stage enums / search-by-algo-id. Correctness-first: ask hipBLASLt for the
+    // best heuristic algo (zero-workspace preference) and cache it. The cuBLASLt
+    // algo-id filtering and tile/stage debug strings are NVIDIA-only and dropped.
+    void find_algo(
+        const core::Context& ctx,
+        cublasLtMatrixLayout_t layout_A,
+        cublasLtMatrixLayout_t layout_B,
+        cublasLtMatrixLayout_t layout_C,
+        uint32_t M,
+        uint32_t K,
+        uint32_t N,
+        uint32_t batch = 0) {
+        if (algo_id != -1 && (last_m != M || last_batch != batch)) {
+            algo_found = false;
+            hipblasLtMatmulPreference_t preference;
+            BM_CUBLAS_ASSERT(hipblasLtMatmulPreferenceCreate(&preference));
+            uint64_t workspace_size = 0;
+            BM_CUBLAS_ASSERT(hipblasLtMatmulPreferenceSetAttribute(
+                preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &workspace_size, sizeof(workspace_size)));
+            cublasLtMatmulDesc_t matmul_desc = create_desc();
+            const int kRequest = 4;
+            hipblasLtMatmulHeuristicResult_t results[kRequest];
+            int nb_result = 0;
+            auto status = hipblasLtMatmulAlgoGetHeuristic(
+                ctx.current_cublas_handle(), matmul_desc,
+                layout_B, layout_A, layout_C, layout_C,
+                preference, kRequest, &results[0], &nb_result);
+            if (status == HIPBLAS_STATUS_SUCCESS && nb_result > 0) {
+                algo = results[0].algo;
+                algo_found = true;
+            } else if (last_m == 0) {
+                std::cerr << prefix << ", N=" << N << ", K=" << K << ", M=" << M
+                          << ", batch=" << batch << ". hipBLASLt heuristic found no algo.\n";
+            }
+            hipblasLtMatmulPreferenceDestroy(preference);
+            hipblasLtMatmulDescDestroy(matmul_desc);
+            last_m = M;
+            last_batch = batch;
+        }
+    }
+#else
     void find_algo(
         const core::Context& ctx,
         cublasLtMatrixLayout_t layout_A,
@@ -254,6 +308,7 @@ public:
             last_batch = batch;
         }
     }
+#endif // USE_HIP
 
     core::Tensor gemm(
         const core::Context& ctx,
@@ -599,6 +654,7 @@ void Gemm::set_B_scale(const core::Tensor& B_scale) {
     pimpl->b_scale = B_scale.data();
 }
 
+#if !defined(USE_HIP)
 LtGemmAlgoAttr get_algo_attr(const cublasLtMatmulAlgo_t* algo) {
     LtGemmAlgoAttr attr;
     BM_CUBLAS_ASSERT(cublasLtMatmulAlgoConfigGetAttribute(
@@ -683,6 +739,7 @@ std::string stage_to_str(int id) {
     };
     return stage_map.at(static_cast<cublasLtMatmulStages_t>(id)).substr(23);
 }
+#endif // !USE_HIP
 // clang-format on
 
 } // namespace functions

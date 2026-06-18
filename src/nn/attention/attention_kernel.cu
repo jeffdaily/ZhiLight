@@ -23,6 +23,28 @@ using bmengine::core::DataType;
 using bmengine::core::Tensor;
 
 #define WARP_SIZE 32
+
+// Width-32 raw shuffles for the scalar attention paths, which tile a 32-lane
+// NVIDIA warp (128-dim head as lane*4). On HIP the width argument confines the
+// permute to 32-lane sub-groups so it is correct on wave64; on CUDA it is the
+// usual masked warp shuffle.
+template<typename T>
+static __inline__ __device__ T attnShflDown32(T x, int offset) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    return __shfl_down(x, offset, 32);
+#else
+    return __shfl_down_sync(0xFFFFFFFF, x, offset, 32);
+#endif
+}
+template<typename T>
+static __inline__ __device__ T attnShfl32(T x, int src) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    return __shfl(x, src, 32);
+#else
+    return __shfl_sync(0xFFFFFFFF, x, src, 32);
+#endif
+}
+
 template<typename T, typename T2 = T, int DIM_HEAD = 128>
 static __inline__ __device__ void multiply_q_k_block(
     const T* __restrict__ g_q, // (dim_head)
@@ -43,7 +65,7 @@ static __inline__ __device__ void multiply_q_k_block(
         res += float(*reinterpret_cast<T*>(&a4.y)) * float(*reinterpret_cast<T*>(&b4.y));
         res += float(*reinterpret_cast<T*>(&a4.z)) * float(*reinterpret_cast<T*>(&b4.z));
         res += float(*reinterpret_cast<T*>(&a4.w)) * float(*reinterpret_cast<T*>(&b4.w));
-        res = functions::warpReduceSum<float>(res);
+        res = functions::warpReduceSumWidth<float, WARP_SIZE>(res);
         if (laneId == 0)
             logit[col] = T2(res);
     }
@@ -93,7 +115,7 @@ static __inline__ __device__ void multiply_q_k_block_d64(
         short2 b2 = *reinterpret_cast<const short2*>(g_k + col * stride_k + laneId * 2);
         res += float(*reinterpret_cast<T*>(&a2.x)) * float(*reinterpret_cast<T*>(&b2.x));
         res += float(*reinterpret_cast<T*>(&a2.y)) * float(*reinterpret_cast<T*>(&b2.y));
-        res = functions::warpReduceSum<float>(res);
+        res = functions::warpReduceSumWidth<float, WARP_SIZE>(res);
         if (laneId == 0)
             logit[col] = T2(res);
     }
@@ -137,7 +159,7 @@ static __inline__ __device__ void multiply_q_k_block_mq1(
             res += float(*reinterpret_cast<T*>(&a4.y)) * float(*reinterpret_cast<T*>(&b4.y));
             res += float(*reinterpret_cast<T*>(&a4.z)) * float(*reinterpret_cast<T*>(&b4.z));
             res += float(*reinterpret_cast<T*>(&a4.w)) * float(*reinterpret_cast<T*>(&b4.w));
-            res = functions::warpReduceSum<float>(res);
+            res = functions::warpReduceSumWidth<float, WARP_SIZE>(res);
             if (laneId == 0)
                 logit[q * len_buf + col] = T2(res);
         }
@@ -190,12 +212,12 @@ static __device__ void multiply_score_v_block2(
     __syncthreads();
     float x = tmp[threadIdx.x];
     if (NUM_SPLIT == 16)
-        x += __shfl_down_sync(0xFFFFFFFF, x, 8);
+        x += attnShflDown32(x, 8);
     if (NUM_SPLIT >= 8)
-        x += __shfl_down_sync(0xFFFFFFFF, x, 4);
+        x += attnShflDown32(x, 4);
     if (NUM_SPLIT >= 4)
-        x += __shfl_down_sync(0xFFFFFFFF, x, 2);
-    x += __shfl_down_sync(0xFFFFFFFF, x, 1);
+        x += attnShflDown32(x, 2);
+    x += attnShflDown32(x, 1);
     if ((threadIdx.x % NUM_SPLIT) == 0) {
         output[threadIdx.x / NUM_SPLIT] = T2(x);
     }
@@ -230,6 +252,11 @@ static __device__ void multiply_score_v_block_mq1(
     }
 }
 
+// Tensor-core (wmma / nvcuda) attention path: NVIDIA-only, reimplement-not-port.
+// Disabled on the first AMD pass; the dispatch below routes to the portable
+// scalar multiply_q_k_block / multiply_score_v_block path under USE_HIP. An
+// AMD-native rocWMMA/MFMA decode path is a deferred follow-up.
+#if !defined(USE_HIP)
 using namespace nvcuda;
 
 template<typename T, int M_Q = 8, int N_BUF = 32, int K_DIM = 16, int DIM_HEAD = 128>
@@ -390,45 +417,58 @@ static __forceinline__ __device__ void multiply_score_v_block_wmma2(
     if (M_Q == 16)
         output[q_head_offset + threadIdx.x] = T(v1);
 }
+#endif // !USE_HIP  (tensor-core wmma path)
 
-// use outer shared memory
+// use outer shared memory. Wave-size driven (BM_WARP_SIZE = 64 on CDNA, 32 on
+// RDNA/CUDA) so the per-warp partials match functions::warpReduce*; shared[]
+// here must be sized >= num_warps+1 by the caller (max 1024/32 + 1 = 33).
 template<typename T>
 __inline__ __device__ T blockReduceMax(T x, T* shared) {
-    int lane = threadIdx.x % 32;
-    int wid = threadIdx.x / 32;
+    int lane = threadIdx.x % BM_WARP_SIZE;
+    int wid = threadIdx.x / BM_WARP_SIZE;
     x = functions::warpReduceMax<T>(x);
     if (lane == 0)
         shared[wid] = x;
     __syncthreads();
 
     if (wid == 0) {
-        x = (threadIdx.x < blockDim.x / 32) ? shared[lane] : -functions::Inf<T>();
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        int num_warps = (blockDim.x + BM_WARP_SIZE - 1) / BM_WARP_SIZE;
+        x = (lane < num_warps) ? shared[lane] : -functions::Inf<T>();
+#else
+        x = (threadIdx.x < blockDim.x / BM_WARP_SIZE) ? shared[lane] : -functions::Inf<T>();
+#endif
         x = functions::warpReduceMax<T>(x);
         if (lane == 0)
-            shared[32] = x;
+            shared[BM_BLOCK_REDUCE_MAX_WARPS - 1] = x;
     }
     __syncthreads();
-    return shared[32]; // avoid RAW hazard
+    return shared[BM_BLOCK_REDUCE_MAX_WARPS - 1]; // avoid RAW hazard
 }
 
 // use outer shared memory
 template<typename T>
 __inline__ __device__ T blockReduceSum(T x, T* shared) {
-    int lane = threadIdx.x % 32;
-    int wid = threadIdx.x / 32;
+    int lane = threadIdx.x % BM_WARP_SIZE;
+    int wid = threadIdx.x / BM_WARP_SIZE;
     x = functions::warpReduceSum<T>(x);
     if (lane == 0)
         shared[wid] = x;
     __syncthreads();
 
     if (wid == 0) {
-        x = (threadIdx.x < blockDim.x / 32) ? shared[lane] : T(0.);
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        int num_warps = (blockDim.x + BM_WARP_SIZE - 1) / BM_WARP_SIZE;
+        x = (lane < num_warps) ? shared[lane] : T(0.);
+#else
+        x = (threadIdx.x < blockDim.x / BM_WARP_SIZE) ? shared[lane] : T(0.);
+#endif
         x = functions::warpReduceSum<T>(x);
         if (lane == 0)
-            shared[32] = x;
+            shared[BM_BLOCK_REDUCE_MAX_WARPS - 1] = x;
     }
     __syncthreads();
-    return shared[32]; // avoid RAW hazard
+    return shared[BM_BLOCK_REDUCE_MAX_WARPS - 1]; // avoid RAW hazard
 }
 
 template<typename T>
@@ -800,6 +840,8 @@ static __global__ void KERNEL_mqa_rag_buffer_split_kv(
 }
 
 // gridDim (len_q * split, num_kv_heads * m_query, batch),  blockDim (dim_head)
+// int8-quantized-KV attention; NVIDIA-PTX dequant, deferred on the first AMD pass.
+#if !defined(USE_HIP)
 template<typename T, int DIM_HEAD = 128, int O_DIM_HEAD = DIM_HEAD>
 static __global__ void KERNEL_mqa_rag_buffer_split_kv_quant(
     const half* __restrict__ g_q,      // (batch, len_q, num_kv_heads * m_query, dim_head）
@@ -876,6 +918,7 @@ static __global__ void KERNEL_mqa_rag_buffer_split_kv_quant(
         DEV_mul_score_v_v1<T, O_DIM_HEAD, float>(smem, val_buf, cache, len_buf2, stride_kv);
     }
 }
+#endif // !USE_HIP  (int8-quantized-KV attention kernel)
 
 // gridDim (num_virtual_heads / batch, batch),  blockDim (dim_head)
 template<typename T>
@@ -897,12 +940,12 @@ static __global__ void KERNEL_mqa_combine(
         local_max = g_local_max[h * num_split + laneId];
         local_sum_exp = g_local_sum_exp[h * num_split + laneId];
     }
-    float global_max = functions::warpReduceMax<float>(local_max);
-    global_max = __shfl_sync(0xFFFFFFFF, global_max, 0);
+    float global_max = functions::warpReduceMaxWidth<float, WARP_SIZE>(local_max);
+    global_max = attnShfl32(global_max, 0);
     float scale1 = laneId < num_split ? expf(local_max - global_max) : 0.;
     float local_sum_exp2 = local_sum_exp * scale1;
-    float global_sum_exp = functions::warpReduceSum<float>(local_sum_exp2);
-    global_sum_exp = __shfl_sync(0xFFFFFFFF, global_sum_exp, 0);
+    float global_sum_exp = functions::warpReduceSumWidth<float, WARP_SIZE>(local_sum_exp2);
+    global_sum_exp = attnShfl32(global_sum_exp, 0);
     float scale2 = local_sum_exp / global_sum_exp * scale1;
     //    if (threadIdx.x == 1 && h == 1)
     //        printf("h=%d local_max=%f, global_max=%f, local_sum_exp2=%f, global_sum_exp=%f\n", h,
@@ -914,7 +957,7 @@ static __global__ void KERNEL_mqa_combine(
     for (int i = 0; i < num_split; ++i) {
         // float v = cache[(h * num_split + i) * DIM_HEAD + threadIdx.x];
         float v = cache[i * DIM_HEAD];
-        float scale = __shfl_sync(0xFFFFFFFF, scale2, i);
+        float scale = attnShfl32(scale2, i);
         //        if (threadIdx.x == 0 && h == 1)
         //            printf("h=%d v=%f, scale=%f\n", h, v, scale);
         res += v * scale;
@@ -1054,10 +1097,15 @@ static __global__ void KERNEL_mqa_self(
     const unsigned int len_buf_cut = (q + 32) / 32 * 32; // little speed up after cut
     // const unsigned int len_buf_cut = len_buf;
     // Q * K  (m_query, dim_head) * (len_buf, dim_head) => (m_query, len_buf)
+#if defined(USE_HIP)
+    // wmma tensor-core path disabled on AMD; always use the scalar path.
+    multiply_q_k_block_mq1(s_q, g_k, score, len_buf_cut);
+#else
     if (high_precision)
         multiply_q_k_block_mq1(s_q, g_k, score, len_buf_cut);
     else
         multiply_q_k_block_wmma<T>(s_q, g_k, score, len_buf_cut);
+#endif
     __syncthreads();
 
     // Softmax
@@ -1070,6 +1118,9 @@ static __global__ void KERNEL_mqa_self(
     __syncthreads();
 
     // Score * V (m_query, len_buf) * (len_buf, dim_head) => (m_query, dim_head)
+#if defined(USE_HIP)
+    multiply_score_v_block_mq1(score, g_v, output, len_buf_cut);
+#else
     if (high_precision > 0) {
         multiply_score_v_block_mq1(score, g_v, output, len_buf_cut);
     } else {
@@ -1084,6 +1135,7 @@ static __global__ void KERNEL_mqa_self(
                 score_t, g_v, output, len_buf_cut, reinterpret_cast<float*>(s_q));
         }
     }
+#endif
 }
 
 void mul_qk_rag_buffer(
@@ -1301,7 +1353,13 @@ void multi_query_attention_rag_buffer(
     }
     // std::cout << "max_len_buf=" << max_len_buf << ", num_split=" << num_split << ", split_kv_thres=" << split_kv_thres << endl;
 
+#if defined(USE_HIP)
+    // The wmma (tensor-core) MQA path is disabled on AMD; force the portable
+    // scalar KERNEL_mqa_rag_buffer1 path.
+    static bool use_mma = false;
+#else
     static bool use_mma = utils::get_int_env("CPM_MQ_ATTN_MMA", 0) && m_query == 8;
+#endif
     if (algo_id == -1 || batch_q.dtype() == DataType::kBFloat16)
         algo_id = 1; // default to 1
     if (num_split > 1 && algo_id == 1) {
@@ -1314,6 +1372,10 @@ void multi_query_attention_rag_buffer(
 
         auto out_dtype = batch_q.dtype();
         if (scale_key_addrs.numel()) {
+#if defined(USE_HIP)
+            BM_EXCEPTION("int8-quantized KV-cache attention is not supported on ROCm/HIP "
+                         "(NVIDIA-PTX dequant path deferred). Use an unquantized KV cache.");
+#else
             BM_ASSERT(dim_head == 128, "Unsupported dim_head");
             BM_ASSERT_EQ(batch_q.dtype(), core::DataType::kHalf, "input must be half");
             out_dtype = dequant_dtype;
@@ -1339,6 +1401,7 @@ void multi_query_attention_rag_buffer(
                 );
             });
             BM_CUDART_ASSERT(cudaGetLastError());
+#endif
         } else {
             BM_DTYPE_DISPATCH_HALF(out_dtype, {
                 auto kernel = KERNEL_mqa_rag_buffer_split_kv<scalar_t, 128>;
@@ -1485,8 +1548,9 @@ void multi_query_self_attention(
         dim3 gridDim(len_q, num_kv_heads);
         size_t dynamic_size = 8 * (dim_head + std::max(2048, len_buf)) * sizeof(float) + 32;
 
+        auto mqa_self_kernel = KERNEL_mqa_self<__half, 128, 8>;
         BM_CUDART_ASSERT(cudaFuncSetAttribute(
-            KERNEL_mqa_self<__half, 128, 8>,
+            mqa_self_kernel,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             dynamic_size));
         KERNEL_mqa_self<__half, 128, 8><<<gridDim, 1024, dynamic_size, stream>>>(

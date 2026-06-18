@@ -97,12 +97,18 @@ public:
     }
 
     Tensor gptq_fused_up(const core::Context& ctx, const Tensor& input) {
+#if defined(USE_HIP)
+        // GPTQ fused gate-up uses the deferred gptq kernels; never reached on
+        // AMD (support_fuse_gptq_gate_in returns false here).
+        BM_EXCEPTION("GPTQ fused gate-up is not supported on ROCm/HIP (deferred).");
+#else
         // Fuse 'w_in' and 'w_gated' and activation into a kernel.
         // i.e. activate(input X 'w_in') * (input * 'w_gated')
         auto[qw1, qz1, scales1, sym1] = w_in.get_gptq_weights();
         auto[qw2, qz2, scales2, sym2] = w_gated.get_gptq_weights();
         return nn::gptq::gemm_fuse_gate_in(
             ctx, input, qw1, qz1, scales1, Tensor(), qw2, qz2, scales2, Tensor(), sym1);
+#endif
     }
 
     void try_fuse_up_weights(const core::Context& ctx) {
@@ -868,6 +874,9 @@ public:
 
 };
 
+// GPTQ-fused and fp8-block MOE experts use the deferred gptq / fp8 quant
+// kernels (excluded from the HIP build); their factory branches throw on AMD.
+#if !defined(USE_HIP)
 class FeedForward::impl::GPTQMOE : public FeedForward::impl::FusedMOE {
 public:
     GPTQMOE(
@@ -1239,6 +1248,7 @@ public:
         return with_share(ctx, input, ret);
     }
 };
+#endif // !USE_HIP  (GPTQ / fp8-block MOE experts)
 
 FeedForward::FeedForward(
     const core::Context& ctx,
@@ -1261,6 +1271,15 @@ FeedForward::FeedForward(
 //                << ", dyn_shared=" << dyn_shared << endl;
 //        }
         impl::MOEImpl* ptr;
+#if defined(USE_HIP)
+        // GPTQ-fused and fp8-block MOE use deferred quant kernels on AMD; the
+        // generic MOEImpl path (fp16/bf16) is used instead.
+        if (grouped_fp8_gemm || (fuse_moe && gptq_kernel_algo == 1)) {
+            BM_EXCEPTION("FUSE_GPTQ_MOE / GROUPED_FP8_GEMM MOE is not supported on ROCm/HIP "
+                         "(deferred); unset these env vars to use the generic MOE path.");
+        }
+        ptr = new impl::MOEImpl(ctx, cfg, quant_config, parallel);
+#else
         if (grouped_fp8_gemm) {
             ptr = new impl::FP8BlockMOE(ctx, cfg, quant_config, parallel, dyn_shared);
         } else if (fuse_moe && gptq_kernel_algo == 1) {
@@ -1268,6 +1287,7 @@ FeedForward::FeedForward(
         } else {
             ptr = new impl::MOEImpl(ctx, cfg, quant_config, parallel);
         }
+#endif
         add_submodule("router", ptr->router.get());
         for (int i = 0; i < ptr->num_local_experts; ++i) {
             auto p = ptr->experts[i];

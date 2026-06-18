@@ -7,6 +7,12 @@
 #include <vector_types.h>
 #include <bmengine/functions/reduce.cuh>
 
+// int8-quantized-KV attention: the dequant uses NVIDIA prmt.b32 / sub.f16x2
+// PTX (reimplement-not-port). Disabled on the first AMD pass; the int8 KV-cache
+// attention kernel and its launcher are gated off under USE_HIP and route to an
+// explicit unsupported error. An AMD-native int8-KV path is a deferred follow-up.
+#if !defined(USE_HIP)
+
 static __inline__ __device__ void DEV_dequant_int8(
     uint32_t const i8s, half2 (&result)[2]
 ) {
@@ -121,3 +127,5 @@ static __device__ void DEV_mul_score_v_v1(
         output[threadIdx.x / NUM_SPLIT] = T2(x);
     }
 }
+
+#endif // !USE_HIP  (int8-quantized-KV attention PTX path)

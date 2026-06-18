@@ -23,7 +23,7 @@ static __global__ void KERNEL_quant_group_32(
         size_t offset = m * 32;
         int i = threadIdx.x;
         float v = inp[offset + i];
-        float abs_max = functions::warpReduceMaxB<T>(fabsf(v));
+        float abs_max = functions::warpReduceMaxWidthB<float, 32>(fabsf(v));
 
         out[offset + i] = int8_t(nearbyintf(v * 127.0f / abs_max));
         if (threadIdx.x == 0) {
@@ -53,7 +53,7 @@ static __global__ void KERNEL_quant_group_32_v2(
             size_t offset = m * 32;
             int i = threadIdx.x;
             float v = inp[offset + i];
-            float abs_max = functions::warpReduceMaxB<T>(fabsf(v));
+            float abs_max = functions::warpReduceMaxWidthB<float, 32>(fabsf(v));
 
             out[offset + i] = int8_t(nearbyintf(v * 127.0f / abs_max));
             if (threadIdx.x == 0) {
@@ -89,7 +89,7 @@ std::tuple<core::Tensor, core::Tensor> quant_group_32(
     cudaStream_t stream = ctx.current_stream()->ptr;
 
     BM_DTYPE_DISPATCH_HALF(input.dtype(), {
-        KERNEL_quant_group_32<scalar_t><<<round_up(M, 32) / 32, {32, 32}, 0, stream>>>(
+        KERNEL_quant_group_32<scalar_t><<<round_up(M, 32) / 32, dim3(32, 32), 0, stream>>>(
         input.data<scalar_t>(),
         output.mutable_data<int8_t>(),
         output_scale.mutable_data<scalar_t>(),
@@ -130,7 +130,7 @@ void dequant_group_32(
 
     cudaStream_t stream = ctx.current_stream()->ptr;
     BM_DTYPE_DISPATCH_FLOAT(scale.dtype(), {
-        KERNEL_dequant_group_32<scalar_t><<<round_up(M, 32) / 32, {32, 32}, 0, stream>>>(
+        KERNEL_dequant_group_32<scalar_t><<<round_up(M, 32) / 32, dim3(32, 32), 0, stream>>>(
             q.data<int8_t>(),
             scale.data<scalar_t>(),
             output->mutable_data<scalar_t>(),
@@ -227,7 +227,7 @@ core::Tensor dequant_group_fuse_add(
 
     cudaStream_t stream = ctx.current_stream()->ptr;
     BM_DTYPE_DISPATCH_FLOAT(scale.dtype(), {
-        KERNEL_dequant_group_fuse_add<scalar_t><<<round_up(M, 32) / 32, {32, 32}, 0, stream>>>(
+        KERNEL_dequant_group_fuse_add<scalar_t><<<round_up(M, 32) / 32, dim3(32, 32), 0, stream>>>(
             q.data<int8_t>(),
             scale.data<scalar_t>(),
             c.data<scalar_t>(),
@@ -264,7 +264,7 @@ static __global__ void KERNEL_dequant_sum_quant_g32(
 //        sum += q * s;
     }
 
-    float abs_max = functions::warpReduceMaxB<T>(fabsf(sum));
+    float abs_max = functions::warpReduceMaxWidthB<float, 32>(fabsf(sum));
 
     out_q[offset_i] = int8_t(nearbyintf(sum * 127.0f / abs_max));
 

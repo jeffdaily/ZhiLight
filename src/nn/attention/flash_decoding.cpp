@@ -16,6 +16,17 @@ using bmengine::functions::transpose_2_1;
 using namespace flash;
 #endif
 
+#if defined(USE_HIP)
+// The flash-attn .so is a CUDA binary not linked on ROCm (ABI/symbols differ);
+// its run_mha_fwd entry is unavailable. The in-tree attention path covers
+// prefill (ENABLE_FLASH_MHA is undefined). Any call into the flash-attn prefill
+// here is a configuration error on AMD, so fail loudly instead of referencing
+// the missing symbol. ROCm flash-attn is a deferred follow-up.
+#define run_mha_fwd(...) \
+    throw std::runtime_error("flash-attn prefill is not available on ROCm/HIP (deferred); " \
+                             "use the in-tree attention path")
+#endif
+
 FlashDecoding::FlashDecoding(const Context& ctx) {
     BM_CUDART_ASSERT(cudaGetDeviceProperties(&dprops, ctx.active_device()));
     params = new Flash_fwd_params();

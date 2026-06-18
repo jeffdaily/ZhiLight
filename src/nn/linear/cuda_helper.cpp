@@ -1,6 +1,11 @@
 #include <bmengine/core/exception.h>
 #include <cuda.h>
 
+#if defined(USE_HIP)
+// gfx90a/CDNA has no programmable L2 access-policy window; this is a no-op on
+// AMD (the only caller is commented out at its call sites in linear.cpp).
+void setL2AccessPolicyWindow(cudaStream_t stream, void* data, int window_size, float hitRatio) {}
+#else
 // https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#l2-cache-access-window
 void setL2AccessPolicyWindow(cudaStream_t stream, void* data, int window_size, float hitRatio) {
     cudaStreamAttrValue stream_attribute;                                         // Stream level attributes data structure
@@ -17,3 +22,4 @@ void setL2AccessPolicyWindow(cudaStream_t stream, void* data, int window_size, f
 //    if (window_size == 0)
 //        BM_CUDART_ASSERT(cudaCtxResetPersistingL2Cache());
 }
+#endif

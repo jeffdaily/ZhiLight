@@ -11,7 +11,34 @@ namespace functions {
 using bmengine::core::Tensor;
 
 // https://nvidia.github.io/cccl/cub/api/structcub_1_1DeviceRadixSort.html
+//
+// rocPRIM's DeviceRadixSort (hipCUB backend) only accepts native radix-sortable
+// key types; half/__hip_bfloat16 keys require a custom decomposer (CUB takes
+// __half directly). The half/bf16 key sort is not on the inference fast path,
+// so on HIP it is left unsupported (runtime error if ever reached) rather than
+// shipping an order-incorrect bit-cast sort.
 template<typename KeyT>
+struct RadixSortable { static constexpr bool value = true; };
+#if defined(USE_HIP)
+template<> struct RadixSortable<half> { static constexpr bool value = false; };
+template<> struct RadixSortable<nv_bfloat16> { static constexpr bool value = false; };
+#endif
+
+template<typename KeyT,
+         typename std::enable_if<!RadixSortable<KeyT>::value, int>::type = 0>
+std::pair<core::Tensor, core::Tensor> sort_1d_temp(
+    const core::Context& ctx,
+    const core::Tensor& keys,
+    const core::Tensor& values,
+    int max_key)
+{
+    BM_EXCEPTION("sort_pair_1d with half/bfloat16 keys is not supported on ROCm/HIP "
+                 "(rocPRIM radix sort needs a decomposer for these key types).");
+    return {};
+}
+
+template<typename KeyT,
+         typename std::enable_if<RadixSortable<KeyT>::value, int>::type = 0>
 std::pair<core::Tensor, core::Tensor> sort_1d_temp(
     const core::Context& ctx,
     const core::Tensor& keys,

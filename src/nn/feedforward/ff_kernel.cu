@@ -136,7 +136,11 @@ static __device__ __forceinline__ void DEV_softmax_inplace(const T* logits, floa
     if (blockDim.x > 32)
         local_max = functions::blockReduceMax(local_max);
     else
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        local_max = functions::warpReduceMaxWidthB<float, 32>(local_max);
+#else
         local_max = functions::warpReduceMaxB(local_max);
+#endif
 
     float local_sum = 1e-20;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -146,7 +150,11 @@ static __device__ __forceinline__ void DEV_softmax_inplace(const T* logits, floa
     if (blockDim.x > 32)
         local_sum = functions::blockReduceSum(local_sum);
     else
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        local_sum = functions::warpReduceSumWidthB<float, 32>(local_sum);
+#else
         local_sum = functions::warpReduceSumB(local_sum);
+#endif
 
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         data[i] /= local_sum;
@@ -284,8 +292,13 @@ static __device__ inline void warpBitonicSort(T& v1, int& pos, bool asc = false)
         bool desc = ((lane_id & k) == 0) ^ asc;
 #pragma unroll
         for (int j = k / 2; j > 0; j /= 2) {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+            T v2 = __shfl_xor(v1, j);
+            int pos2 = __shfl_xor(pos, j);
+#else
             T v2 = __shfl_xor_sync(0xFFFFFFFF, v1, j);
             int pos2 = __shfl_xor_sync(0xFFFFFFFF, pos, j);
+#endif
             bool upper = (lane_id & j) != 0;
 
             if (desc ^ (v1 > v2 || (v1 == v2 && pos < pos2)) ^ upper) {

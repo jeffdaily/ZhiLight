@@ -48,7 +48,15 @@ inline T ceil_div(T m, Tb d) {
 
 template<typename T>
 inline T round_up_thread(T m) {
+    // Round the block size up to a whole wavefront/warp. On CDNA (gfx90a) the
+    // wavefront is 64, so rounding to 32 would launch a half-filled wavefront;
+    // the full-wavefront shuffles in the warp/block reductions then read
+    // inactive lanes and give wrong amax/amin/etc. Round to 64 on HIP.
+#if defined(USE_HIP)
+    T d = 64, limit = MAX_NUM_THREADS;
+#else
     T d = 32, limit = MAX_NUM_THREADS;
+#endif
     T x = m > limit ? limit : m;
     return ((x + d - 1) / d) * d;
 }

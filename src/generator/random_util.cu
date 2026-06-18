@@ -11,6 +11,34 @@
 #include <cub/cub.cuh>
 
 namespace beam_utility {
+
+// rocPRIM (hipCUB) radix sort lacks a built-in codec for __hip_bfloat16 keys
+// (half and float are fine). bf16 top-p sampling is not on the validated path,
+// so on HIP its cub::DeviceRadixSort instantiation is skipped (would fail to
+// compile via rocPRIM's identity_decomposer assertion) and the call throws at
+// runtime. CUDA keeps the original cub call for every dtype.
+template<typename KeyT>
+struct HipBf16Key { static constexpr bool value = false; };
+#if defined(USE_HIP)
+template<> struct HipBf16Key<nv_bfloat16> { static constexpr bool value = true; };
+#endif
+
+template<typename KeyT, typename ValueT>
+static inline hipError_t radixSortPairsDescending(
+    void* d_temp, size_t& temp_bytes,
+    const KeyT* keys_in, KeyT* keys_out,
+    const ValueT* vals_in, ValueT* vals_out,
+    int num_items, int begin_bit, int end_bit, hipStream_t stream) {
+    if constexpr (HipBf16Key<KeyT>::value) {
+        BM_EXCEPTION("top-p sampling with bfloat16 probs is not supported on ROCm/HIP "
+                     "(rocPRIM radix sort has no bf16 key codec). Use float/half probs.");
+        return hipSuccess;
+    } else {
+        return cub::DeviceRadixSort::SortPairsDescending(
+            d_temp, temp_bytes, keys_in, keys_out, vals_in, vals_out,
+            num_items, begin_bit, end_bit, stream);
+    }
+}
 // gridDim (n / 1024, 1, 1),    blockDim(1024, 1, 1)
 template<typename T>
 static __global__ void BM_KERNEL(random_repetition_penalty)(
@@ -139,14 +167,14 @@ void random_sampler_gpu(
 
     BM_DTYPE_DISPATCH_FLOAT(probs.dtype(), {
         size_t temp_buffer_size1, temp_buffer_size2;
-        cub::DeviceRadixSort::SortPairsDescending(
-            nullptr,
+        radixSortPairsDescending(
+            (void*) nullptr,
             temp_buffer_size1,
             values_out.data<scalar_t>(),
             values_out.data<scalar_t>(),
             indicies_in.data<int32_t>(),
             indicies_out.data<int32_t>(),
-            n_classes);
+            n_classes, 0, sizeof(scalar_t) * 8, (hipStream_t) 0);
         cub::DeviceScan::InclusiveSum(
             nullptr,
             temp_buffer_size2,
@@ -161,7 +189,7 @@ void random_sampler_gpu(
         CURAND_CHECK(curandGenerateUniform(gen, p_random.data<float>(), p_random.size(0)));
         for (int i = 0; i < batch; i++) {
             scalar_t* offset_prob = (probs.data<scalar_t>() + i * n_classes);
-            BM_CUDART_ASSERT(cub::DeviceRadixSort::SortPairsDescending(
+            BM_CUDART_ASSERT(radixSortPairsDescending(
                 temp.data(),
                 temp_buffer_size,
                 offset_prob,

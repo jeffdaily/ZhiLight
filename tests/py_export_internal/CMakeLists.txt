@@ -1,10 +1,18 @@
-enable_language(CUDA)
+if(USE_HIP)
+    enable_language(HIP)
+else()
+    enable_language(CUDA)
+    set(TORCH_CUDA_ARCH_LIST "8.0+PTX;8.9")
+endif()
 
 project(internals_)
-set(CMAKE_CXX_STANDARD 17)
+if(USE_HIP)
+    set(CMAKE_CXX_STANDARD 20)  # ROCm torch 2.13 headers need C++20 concepts
+else()
+    set(CMAKE_CXX_STANDARD 17)
+endif()
 set(CMAKE_CXX_VISIBILITY_PRESET default)
 set(CMAKE_CUDA_VISIBILITY_PRESET default)
-set(TORCH_CUDA_ARCH_LIST "8.0+PTX;8.9")
 
 execute_process(COMMAND ${PYTHON_EXECUTABLE} -c "import torch; print(torch.utils.cmake_prefix_path)" OUTPUT_VARIABLE PYTORCH_CMAKE_PREFIX_PATH OUTPUT_STRIP_TRAILING_WHITESPACE)
 list(APPEND CMAKE_PREFIX_PATH "${PYTORCH_CMAKE_PREFIX_PATH}/Torch")
@@ -18,7 +26,14 @@ file(GLOB_RECURSE TEST_SRC_NN "*.cpp")
 list(APPEND TEST_SRC_NN "../../src/py_export/py_utils.cpp")
 
 message("ADD pybind11 module for unittest ${PROJECT_NAME}")
-pybind11_add_module(${PROJECT_NAME} ${TEST_SRC_NN})
+if(USE_HIP)
+    # NO_EXTRAS drops pybind11's -flto (HIP link does not finalize LTO -> the
+    # .so loses PyInit_*).
+    pybind11_add_module(${PROJECT_NAME} NO_EXTRAS ${TEST_SRC_NN})
+    set_target_properties(${PROJECT_NAME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+else()
+    pybind11_add_module(${PROJECT_NAME} ${TEST_SRC_NN})
+endif()
 
 #target_include_directories(${PROJECT_NAME} PRIVATE ${Python_SITELIB}/torch/include)
 

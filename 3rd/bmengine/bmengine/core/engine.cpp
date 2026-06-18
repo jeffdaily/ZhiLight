@@ -70,13 +70,18 @@ DeviceHandles::DeviceHandles(int dev_id, ncclUniqueId uniqueID, int tp_rank, int
         std::cout << "CC:" << compute_capability
             << ", mp_count:" << mp_count
             << ", L2 Cache:" << (l2_cache_size / 1024 / 1024) << "MB"
+#if !defined(USE_HIP)
             << ", Max Persistent L2:" << (dev_prop.persistingL2CacheMaxSize / 1024) << "KB"
+#endif
             << ", max_smem:" << (max_shared_memory / 1024) << "KB\n";
+#if !defined(USE_HIP)
+    // The persisting-L2-cache device limit is not programmable on CDNA/gfx90a.
     int max_persist_l2 = get_int_env("MAX_PERSIST_L2", 0);
     if (max_persist_l2)  {
         BM_CUDART_ASSERT(
             cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, max_persist_l2 * 1024 * 1024));
     }
+#endif
 }
 DeviceHandles::~DeviceHandles() {
     DeviceGuard guard(dev_id);
