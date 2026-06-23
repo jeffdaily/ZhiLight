@@ -4,9 +4,8 @@ project(bmengine VERSION 0.1)
 enable_language(C)
 enable_language(CXX)
 if(USE_HIP)
-  if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
-    set(CMAKE_HIP_ARCHITECTURES "gfx90a")
-  endif()
+  # enable_language(HIP) honors -DCMAKE_HIP_ARCHITECTURES, otherwise auto-detects the
+  # host GPU(s) and errors if none is found; do not pin a default arch here.
   enable_language(HIP)
 else()
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
