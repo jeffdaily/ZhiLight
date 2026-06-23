@@ -23,12 +23,9 @@ else()
 endif()
 
 if(USE_HIP)
-    # Default to gfx90a only when the cache var is unset, so other GPUs build
-    # with just -DCMAKE_HIP_ARCHITECTURES=<arch> and no source edit.
-    if(NOT DEFINED CMAKE_HIP_ARCHITECTURES OR CMAKE_HIP_ARCHITECTURES STREQUAL "")
-        set(CMAKE_HIP_ARCHITECTURES "gfx90a")
-    endif()
     message("CMAKE_HIP_ARCHITECTURES: ${CMAKE_HIP_ARCHITECTURES}")
+    # enable_language(HIP) honors -DCMAKE_HIP_ARCHITECTURES, otherwise auto-detects
+    # the host GPU(s) and errors if none is found (no-GPU build host sets the arch).
     enable_language(HIP)
     add_definitions(-DUSE_HIP=1 -DUSE_ROCM=1)
     set(ZL_HIP_COMPAT_DIR "${PROJECT_SOURCE_DIR}/hip_compat")
